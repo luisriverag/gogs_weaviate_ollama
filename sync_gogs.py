@@ -12,7 +12,7 @@ import subprocess
 import concurrent.futures as cf
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 import urllib.request
 import urllib.error
@@ -248,6 +248,7 @@ class RepoCache:
 
 RepoContent = Dict[str, Any]
 
+    
 def process_repository(repo_path: Path, cache: RepoCache) -> Optional[List[RepoContent]]:
     """Process repository and extract indexable content."""
     
@@ -282,6 +283,10 @@ def process_repository(repo_path: Path, cache: RepoCache) -> Optional[List[RepoC
             # Get relative path within repo
             rel_path = file_path.relative_to(repo_path)
             
+            # FIX: Convert timestamp to RFC3339 format with timezone
+            mtime = file_path.stat().st_mtime
+            last_modified = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            
             # Create content entry
             content = {
                 "title": f"{repo_name}/{rel_path}",
@@ -290,7 +295,7 @@ def process_repository(repo_path: Path, cache: RepoCache) -> Optional[List[RepoC
                 "repository": repo_name,
                 "content": text_content,
                 "file_type": file_path.suffix.lower(),
-                "last_modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+                "last_modified": last_modified,  # Now in RFC3339 format
                 "file_size": file_path.stat().st_size,
             }
             
@@ -303,7 +308,8 @@ def process_repository(repo_path: Path, cache: RepoCache) -> Optional[List[RepoC
     # Update cache
     cache.update_repo(repo_path)
     
-    return contents if contents else None
+    return contents if contents else None    
+
 
 # ────────────────── Repository syncing ──────────────────
 
