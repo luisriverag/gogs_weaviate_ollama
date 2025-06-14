@@ -2,6 +2,7 @@ weaviate-client>=4.13,<5
 langchain>=0.3,<1
 langchain-weaviate>=0.0.5,<0.1
 langchain-huggingface>=0.3,<0.4
+langchain_ollama
 
 sentence-transformers>=2.6
 transformers>=4.40,<5
@@ -16,3 +17,5 @@ GitPython>=3.1
 requests>=2.31
 tqdm>=4.66
 python-dotenv>=1.0
+
+tiktoken
