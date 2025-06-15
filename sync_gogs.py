@@ -65,20 +65,66 @@ TEXT_EXTENSIONS = {
 def get_host_from_url(url: str) -> str:
     """Extract host:port from URL for token lookup."""
     parsed = urlparse(url)
-    if parsed.port:
-        return f"{parsed.hostname}:{parsed.port}"
-    return parsed.hostname or url
+    
+    # Handle URLs without scheme (add http:// for local IPs)
+    if not parsed.scheme:
+        # If it looks like an IP:port or localhost:port, add http://
+        if ':' in url and (url.startswith('192.168.') or url.startswith('127.0.') or url.startswith('localhost')):
+            url = f"http://{url}"
+            parsed = urlparse(url)
+        else:
+            # For other cases, assume https
+            url = f"https://{url}"
+            parsed = urlparse(url)
+    
+    # FIXED: Return the full URL for local addresses to match token storage format
+    if parsed.hostname in ['localhost', '127.0.0.1'] or (parsed.hostname and parsed.hostname.startswith('192.168.')):
+        # Return full URL format to match how tokens are stored
+        if parsed.port:
+            return f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        else:
+            # Default port based on scheme
+            default_port = 443 if parsed.scheme == 'https' else 80
+            return f"{parsed.scheme}://{parsed.hostname}:{default_port}"
+    else:
+        # For public domains, use just hostname
+        return parsed.hostname or url
+
+def normalize_url(url: str) -> str:
+    """Normalize URL by ensuring it has a proper scheme."""
+    parsed = urlparse(url)
+    
+    if not parsed.scheme:
+        # If it looks like an IP:port or localhost:port, use http://
+        if ':' in url and (url.startswith('192.168.') or url.startswith('127.0.') or url.startswith('localhost')):
+            return f"http://{url}"
+        else:
+            # For other cases, assume https
+            return f"https://{url}"
+    
+    return url
 
 def gogs_api_request(base_url: str, endpoint: str) -> Optional[List[Dict]]:
     """Make authenticated request to GOGS API."""
+    # Normalize the base URL
+    base_url = normalize_url(base_url)
     host = get_host_from_url(base_url)
     token = GOGS_TOKENS.get(host)
     
     if not token:
-        logging.error("No token found for host: %s", host)
+        logging.error("No token found for host: %s (looking for key '%s' in GOGS_TOKENS)", base_url, host)
+        print(f"⚠️  No token found for host: {host}")
+        print(f"   Available tokens: {list(GOGS_TOKENS.keys())}")
         return None
     
-    url = f"{base_url}/api/v1/{endpoint.lstrip('/')}"
+    # Ensure endpoint starts with /
+    if not endpoint.startswith('/'):
+        endpoint = '/' + endpoint
+    
+    url = f"{base_url.rstrip('/')}/api/v1{endpoint}"
+    
+    print(f"🔍 Making API request to: {url}")
+    print(f"   Using token for host: {host}")
     
     try:
         request = urllib.request.Request(url)
@@ -86,13 +132,27 @@ def gogs_api_request(base_url: str, endpoint: str) -> Optional[List[Dict]]:
         request.add_header("Content-Type", "application/json")
         
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode())
+            data = json.loads(response.read().decode())
+            print(f"✅ API request successful, got {len(data) if isinstance(data, list) else 'non-list'} response")
+            return data
     
     except urllib.error.HTTPError as e:
-        logging.error("HTTP error %d for %s: %s", e.code, url, e.reason)
+        error_msg = f"HTTP error {e.code} for {url}: {e.reason}"
+        logging.error(error_msg)
+        print(f"❌ {error_msg}")
+        
+        # Try to read error response
+        try:
+            error_body = e.read().decode()
+            print(f"   Error body: {error_body}")
+        except:
+            pass
+        
         return None
     except Exception as e:
-        logging.error("API request error for %s: %s", url, e)
+        error_msg = f"API request error for {url}: {e}"
+        logging.error(error_msg)
+        print(f"❌ {error_msg}")
         return None
 
 def list_user_repos(base_url: str) -> List[Dict]:
@@ -113,34 +173,72 @@ def run_git_command(command: List[str], cwd: Path) -> bool:
             timeout=300  # 5 minute timeout
         )
         if result.returncode != 0:
-            logging.error("Git command failed in %s: %s", cwd, result.stderr)
+            # Log detailed error information
+            cmd_str = " ".join(command)
+            error_msg = f"Git command failed in {cwd}: {cmd_str}"
+            if result.stderr:
+                error_msg += f"\nSTDERR: {result.stderr.strip()}"
+            if result.stdout:
+                error_msg += f"\nSTDOUT: {result.stdout.strip()}"
+            
+            logging.error(error_msg)
+            
+            # Print non-sensitive error info to console
+            print(f"   ❌ Git error: {result.stderr.strip()[:100]}")
             return False
         return True
     except subprocess.TimeoutExpired:
         logging.error("Git command timeout in %s: %s", cwd, " ".join(command))
+        print(f"   ⏱️ Git command timeout")
         return False
     except Exception as e:
         logging.error("Git command error in %s: %s", cwd, e)
+        print(f"   💥 Git command exception: {e}")
         return False
+
 
 def clone_or_update_repo(repo_url: str, local_path: Path, token: str) -> bool:
     """Clone repository or update existing clone."""
     # Insert token into URL for authentication
     parsed = urlparse(repo_url)
-    auth_url = f"{parsed.scheme}://{token}@{parsed.netloc}{parsed.path}"
+    
+    # Handle different URL formats
+    if parsed.scheme in ['http', 'https']:
+        # For HTTP(S) URLs, insert token as username (Gogs/Gitea style)
+        # Format: https://token@host/path
+        auth_url = f"{parsed.scheme}://{token}@{parsed.netloc}{parsed.path}"
+    else:
+        # For other protocols (like SSH), use as-is
+        auth_url = repo_url
+    
+    print(f"🔗 Cloning from: {parsed.scheme}://[TOKEN]@{parsed.netloc}{parsed.path}")
+    print(f"📁 Local path: {local_path}")
     
     if local_path.exists():
         # Update existing repo
         print(f"🔄 Updating {local_path.name}")
-        return (
+        success = (
             run_git_command(["git", "fetch", "origin"], local_path) and
             run_git_command(["git", "reset", "--hard", "origin/HEAD"], local_path)
         )
+        return success
     else:
         # Clone new repo
         print(f"📥 Cloning {local_path.name}")
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        return run_git_command(["git", "clone", auth_url, str(local_path)], local_path.parent)
+        
+        # Run git clone - git will create the final directory
+        success = run_git_command(["git", "clone", auth_url, str(local_path)], local_path.parent)
+        
+        if not success:
+            # Try alternative authentication methods
+            print(f"🔄 Trying username:password format for {local_path.name}")
+            
+            # Method 2: Try with username:token format (some servers need this)
+            alt_auth_url = f"{parsed.scheme}://gogs:{token}@{parsed.netloc}{parsed.path}"
+            success = run_git_command(["git", "clone", alt_auth_url, str(local_path)], local_path.parent)
+        
+        return success
 
 # ────────────────── Content extraction ──────────────────
 
@@ -313,12 +411,17 @@ def process_repository(repo_path: Path, cache: RepoCache) -> Optional[List[RepoC
 
 # ────────────────── Repository syncing ──────────────────
 
+
 def sync_repositories(*, workers: int, show_progress: bool) -> List[RepoContent]:
     """Sync all configured GOGS repositories."""
     
     if not GOGS_INSTANCES:
         print("⚠️  No GOGS instances configured")
         return []
+    
+    print(f"🔧 Configuration:")
+    print(f"   GOGS_INSTANCES: {GOGS_INSTANCES}")
+    print(f"   Available tokens: {list(GOGS_TOKENS.keys())}")
     
     # Initialize cache
     cache = RepoCache()
@@ -331,33 +434,60 @@ def sync_repositories(*, workers: int, show_progress: bool) -> List[RepoContent]
     repo_paths = []
     
     for base_url in GOGS_INSTANCES:
-        print(f"🔍 Discovering repositories on {base_url}")
-        host = get_host_from_url(base_url)
+        print(f"\n🔍 Discovering repositories on {base_url}")
+        normalized_url = normalize_url(base_url)
+        host = get_host_from_url(normalized_url)
         token = GOGS_TOKENS.get(host)
         
         if not token:
             print(f"⚠️  No token for {host}, skipping")
+            print(f"   Expected token key: '{host}'")
+            print(f"   Available keys: {list(GOGS_TOKENS.keys())}")
             continue
         
-        repos = list_user_repos(base_url)
+        repos = list_user_repos(normalized_url)
         print(f"📊 Found {len(repos)} repositories on {host}")
         
         for repo in repos:
+            # Extract username from full_name (format: "username/reponame")
+            full_name = repo.get("full_name", "")
+            if "/" in full_name:
+                username, repo_name = full_name.split("/", 1)
+            else:
+                # Fallback if full_name is not available
+                username = repo.get("owner", {}).get("login", "unknown")
+                repo_name = repo["name"]
+            
+            # Create proper local path with username
+            # Format: gogs_mirrors/host/username/reponame
+            host_clean = host.replace("http://", "").replace("https://", "").replace(":", "_")
+            local_path = GOGS_MIRROR_DIR / host_clean / username / repo_name
+            
+            # Fix clone URL to use the correct host (not localhost)
+            clone_url = repo["clone_url"]
+            # Replace localhost with the actual IP if needed
+            if "localhost" in clone_url:
+                clone_url = clone_url.replace("localhost", normalized_url.split("://")[1].split(":")[0])
+            
             repo_info = {
-                "name": repo["name"],
-                "clone_url": repo["clone_url"],
+                "name": repo_name,
+                "full_name": full_name,
+                "username": username,
+                "clone_url": clone_url,
                 "host": host,
                 "token": token,
-                "local_path": GOGS_MIRROR_DIR / host / repo["name"]
+                "local_path": local_path
             }
             all_repos.append(repo_info)
-            repo_paths.append(repo_info["local_path"])
+            repo_paths.append(local_path)
+            
+            print(f"   📁 {full_name} → {local_path}")
     
     if not all_repos:
         print("📭 No repositories found")
         return []
     
-    print(f"🔄 Syncing {len(all_repos)} repositories")
+    print(f"\n🔄 Syncing {len(all_repos)} repositories")
     
     # Clean up cache for missing repos
     cache.remove_missing(repo_paths)
@@ -373,7 +503,9 @@ def sync_repositories(*, workers: int, show_progress: bool) -> List[RepoContent]
         )
         
         if not success:
-            print(f"⚠️  Failed to sync {repo_info['name']}")
+            print(f"⚠️  Failed to sync {repo_info['full_name']}")
+        else:
+            print(f"✅ Successfully synced {repo_info['full_name']}")
         
         if sync_bar:
             sync_bar.update(1)
@@ -701,6 +833,7 @@ def clean_cache(cache_file: Path = CACHE_FILE, dry_run: bool = True):
             print(f"✅ Removed {len(to_remove)} orphaned entries")
             print(f"   Cache size: {original_count} → {len(cache_data)} repositories")
             
+    
     except Exception as e:
         print(f"⚠️  Error cleaning cache: {e}")
 
@@ -782,4 +915,4 @@ def main():
         ap.print_help()
 
 if __name__ == "__main__":
-    main()
+    main()    
